@@ -7,6 +7,16 @@
    [ajax.core :refer [json-request-format json-response-format]]
    [clojure.string :as str]))
 
+(defn comp-dbfx
+  [fns]
+  (fn [coeffects event-v]
+    (reduce
+      (fn [db-fx fn]
+        (fn db-fx coeffects event-v))
+      {:fx []
+       :db (:db coeffects)}
+      fns)))
+
 ;; -- Interceptors --------------------------------------------------------------
 ;; Every event handler can be "wrapped" in a chain of interceptors. Each of these
 ;; interceptors can do things "before" and/or "after" the event handler is executed.
@@ -125,98 +135,148 @@
     :dispatch-n [[:get-article-comments {:slug slug}]    ;; changne to app-state :db and future event in this case :dispatch-n
                  [:get-user-profile {:profile (get-in db [:articles slug :author :username])}]]}))
 
+(defn http-xhrio
+  [{:keys [method uri-parts on-success on-failure params]}]
+  (fn [{:keys [db] :as db-fx} coeffects event]
+    (let [uri-parts (if (fn? uri-parts)
+                      (uri-parts db-fx coeffects event)
+                      uri-parts)
+          params    (if (fn? params) ;; TODO verify nil params is safe with :http-xhrio
+                      (params db-fx coeffects event)
+                      params)
+          method    (if (fn? method)
+                      (method db-fx coeffects event)
+                      method)]
+      (update db-fx :fx conj
+              {:http-xhrio
+               {:method          method
+                :uri             (apply endpoint uri-parts)
+                :headers         (auth-header db)             ;; get and pass user token obtained during login
+                :params          params                       ;; include params in the request
+                :format          (json-request-format)
+                :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
+                :on-success      on-success
+                :on-failure      on-failure}}))))
+
+(defn store-articles
+  [db-fx coeffects [_ {articles :articles, articles-count :articlesCount}]]
+  (-> db-fx
+      (assoc-in [:db :articles-count] articles-count)         ;; change app-state by adding articles-count
+      (assoc-in [:db :articles] (index-by :slug articles))))  ;; and articles, which we index-by slug
+
+(defn start-loading-indicator
+  [kw]
+  (fn [db-fx _ _]
+    (assoc-in db-fx [:db :loading kw] true)))
+
+(defn stop-loading-indicator
+  [kw]
+  (fn [db-fx _ _]
+    (assoc-in db-fx [:db :loading kw] false)))                ;; turn off loading flag for this event
+
+(reg-event-fx
+  :get-articles-success
+  (comp-dbfx [(stop-loading-indicator :articles) store-articles]))
+
 ;; -- GET Articles @ /api/articles --------------------------------------------
 ;;
-(reg-event-fx                                               ;; usage (dispatch [:get-articles {:limit 10 :tag "tag-name" ...}])
- :get-articles                                             ;; triggered every time user request articles with differetn params
- (fn [{:keys [db]} [_ params]]                             ;; params = {:limit 10 :tag "tag-name" ...}
-   {:http-xhrio {:method          :get
-                 :uri             (endpoint "articles")  ;; evaluates to "api/articles/"
-                 :params          params                 ;; include params in the request
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:get-articles-success] ;; trigger get-articles-success event
-                 :on-failure      [:api-request-error :get-articles]} ;; trigger api-request-error with :get-articles
-    :db         (-> db
-                    (assoc-in [:loading :articles] true)
-                    (assoc-in [:filter :offset] (:offset params)) ;; base on paassed params set a filter
-                    (assoc-in [:filter :tag] (:tag params)) ;; so that we can easily show and hide
-                    (assoc-in [:filter :author] (:author params)) ;; appropriate ui components
-                    (assoc-in [:filter :favorites] (:favorited params))
-                    (assoc-in [:filter :feed] false))})) ;; we need to disable filter by feed every time since it's not supported query param
+(defn update-filter
+  [db-fx coeffects [_ params]] ;; params = {:limit 10 :tag "tag-name" ...}
+  (-> db-fx
+      (assoc-in [:db :filter :offset] (:offset params)) ;; base on paassed params set a filter
+      (assoc-in [:db :filter :tag] (:tag params)) ;; so that we can easily show and hide
+      (assoc-in [:db :filter :author] (:author params)) ;; appropriate ui components
+      (assoc-in [:db :filter :favorites] (:favorited params))
+      (assoc-in [:db :filter :feed] false))) ;; we need to disable filter by feed every time since it's not supported query param
 
-(reg-event-db
- :get-articles-success
- (fn [db [_ {articles :articles, articles-count :articlesCount}]]
-   (-> db
-       (assoc-in [:loading :articles] false)             ;; turn off loading flag for this event
-       (assoc :articles-count articles-count             ;; change app-state by adding articles-count
-              :articles (index-by :slug articles)))))    ;; and articles, which we index-by slug
+(reg-event-fx ;; usage (dispatch [:get-articles {:limit 10 :tag "tag-name" ...}])
+  :get-articles ;; triggered every time user request articles with differetn params
+  (comp-dbfx [(start-loading-indicator :articles)
+              update-filter
+              (http-xhrio {:method     :get
+                           :uri-parts  ["articles"]                             ;; evaluates to "api/articles/"
+                           :params     (fn [_ _ [_ params]]
+                                         params)
+                           :on-success [:get-articles-success] ;; trigger get-articles-success event
+                           :on-failure [:api-request-error :get-articles]})])) ;; trigger api-request-error with :get-articles
 
 ;; -- GET Article @ /api/articles/:slug ---------------------------------------
 ;;
-(reg-event-fx                                               ;; usage (dispatch [:get-article {:slug "slug"}])
- :get-article                                              ;; triggered when a user upserts article i.e. is redirected to article page after saving an article
- (fn [{:keys [db]} [_ params]]                             ;; params = {:slug "slug"}
-   {:http-xhrio {:method          :get
-                 :uri             (endpoint "articles" (:slug params)) ;; evaluates to "api/articles/:slug"
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:get-article-success] ;; trigger get-article-success event
-                 :on-failure      [:api-request-error :get-article]} ;; trigger api-request-error with :get-articles
-    :db         (assoc-in db [:loading :article] true)}))
+(reg-event-fx        ;; usage (dispatch [:get-article {:slug "slug"}])
+  :get-article        ;; triggered when a user upserts article i.e. is redirected to article page after saving an article
+  (comp-dbfx [(start-loading-indicator :article)
+              (http-xhrio {:method     :get
+                           :uri-parts  (fn [_ _ [_ params]]    ;; params = {:slug "slug"} evaluates to "api/articles/:slug"
+                                         ["articles" (:slug params)])
+                           :on-success [:get-articles-success] ;; trigger get-article-success event
+                           :on-failure [:api-request-error :get-article]})])) ;; trigger api-request-error with :get-articles
+
+(defn store-article
+  [db-fx _ [_ {article :article}]]
+  (assoc-in db-fx [:db :articles] (index-by :slug [article])))
 
 (reg-event-db
  :get-article-success
- (fn [db [_ {article :article}]]
-   (-> db
-       (assoc-in [:loading :article] false)
-       (assoc :articles (index-by :slug [article])))))
+ (comp-dbfx [(stop-loading-indicator :article)
+             store-article]))
 
 ;; -- POST/PUT Article @ /api/articles(/:slug) --------------------------------
 ;;
 (reg-event-fx                                               ;; usage (dispatch [:upsert-article article])
  :upsert-article                                           ;; when we update or insert (upsert) we are sending the same shape of information
- (fn [{:keys [db]} [_ params]]                             ;; params = {:slug "article-slug" :article {:body "article body"} }
-   {:db         (assoc-in db [:loading :article] true)
-    :http-xhrio {:method          (if (:slug params) :put :post) ;; when we get a slug we'll update (:put) otherwise insert (:post)
-                 :uri             (if (:slug params)     ;; Same logic as above but we go with different
-                                    (endpoint "articles" (:slug params)) ;; endpoint - one with :slug to update
-                                    (endpoint "articles")) ;; and another to insert
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :params          {:article (:article params)}
-                 :format          (json-request-format)  ;; make sure we are doing request format wiht json
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:upsert-article-success] ;; trigger upsert-article-success event
-                 :on-failure      [:api-request-error :upsert-article]}})) ;; trigger api-request-error with :upsert-article
+ (comp-dbfx [(start-loading-indicator :article)            ;; params = {:slug "article-slug" :article {:body "article body"}}
+             (http-xhrio {:method     (fn [_ _ [_ params]]
+                                        (if (:slug params) :put :post)) ;; when we get a slug we'll update (:put) otherwise insert (:post)
+                          :uri        (fn [_ _ [_ params]]
+                                        (if (:slug params) ;; Same logic as above but we go with different
+                                          ["articles" (:slug params)] ;; endpoint - one with :slug to update
+                                          ["articles"])) ;; and another to insert
+                          :params     (fn [_ _ [_ params]]
+                                        {:article (:article params)})
+                          :on-success [:upsert-article-success] ;; trigger upsert-article-success event
+                          :on-failure [:api-request-error :upsert-article]})])) ;; trigger api-request-error with :upsert-article
+
+(defn dispatch-get-article
+  [get-slug-fn]
+  (fn [db-fx coeffects event]
+    (update db-fx :fx conj
+            [:dispatch [:get-article {:slug (get-slug-fn db-fx coeffects event)}]])))
+
+(defn dispatch-get-article-comments
+  [get-slug-fn]
+  (fn [db-fx coeffects event]
+    (update db-fx :fx conj
+            [:dispatch [:get-article-comments {:slug (get-slug-fn db-fx coeffects event)}]])))
 
 (reg-event-fx
  :upsert-article-success
- (fn [{:keys [db]} [_ {article :article}]]
-   {:db         (-> db
-                    (assoc-in [:loading :article] false)
-                    (dissoc :comments)                   ;; clean up any comments that we might have in db
-                    (dissoc :errors)                     ;; clean up any erros that we might have in db
-                    (assoc :active-page :article
-                           :active-article (:slug article)))
-    :dispatch-n [[:get-article {:slug (:slug article)}]  ;; when the users clicks save we fetch the new version
-                 [:get-article-comments {:slug (:slug article)}]] ;; of the article and comments from the server
-    :set-url    {:url (str "/article/" (:slug article))}}))
+ (comp-dbfx [(stop-loading-indicator :article)
+             (fn [db-fx _ [_ {article :article}]]
+               (-> db-fx
+                   (dissoc-in [:db :comments])                   ;; clean up any comments that we might have in db
+                   (dissoc-in [:db :errors])                     ;; clean up any erros that we might have in db
+                   (assoc-in [:db :active-page ] :article)
+                   (assoc-in [:db :active-article] (:slug article))
+                   (update :fx conj [:set-url {:url (str "/article/" (:slug article))}])))
+             (dispatch-get-article ;; when the users clicks save we fetch the new version
+               (fn [_ _ [_ {article :article}]]
+                 (:slug article)))
+             (dispatch-get-article-comments ;; of the article and comments from the server
+               (fn [_ _ [_ {article :article}]]
+                 (:slug article)))]))
 
 ;; -- DELETE Article @ /api/articles/:slug ------------------------------------
 ;;
 (reg-event-fx                                               ;; usage (dispatch [:delete-article slug])
  :delete-article                                           ;; triggered when a user deletes an article
- (fn [{:keys [db]} [_ slug]]                               ;; slug = {:slug "article-slug"}
-   {:db         (assoc-in db [:loading :article] true)
-    :http-xhrio {:method          :delete
-                 :uri             (endpoint "articles" slug) ;; evaluates to "api/articles/:slug"
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :params          slug                   ;; pass the article slug to delete
-                 :format          (json-request-format)  ;; make sure we are doing request format wiht json
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:delete-article-success] ;; trigger get-articles-success
-                 :on-failure      [:api-request-error :delete-article]}})) ;; trigger api-request-error with :delete-article
+ (comp-dbfx [(start-loading-indicator :article)
+             (http-xhrio {:method          :delete
+                          :uri             (fn [_ _ [_ slug]]
+                                             ["articles" slug]) ;; slug = {:slug "article-slug"} evaluates to "api/articles/:slug"
+                          :params          (fn [_ _ [_ slug]]
+                                             slug)                   ;; pass the article slug to delete
+                          :on-success      [:delete-article-success] ;; trigger get-articles-success
+                          :on-failure      [:api-request-error :delete-article]})])) ;; trigger api-request-error with :delete-article
 
 (reg-event-fx
  :delete-article-success
@@ -228,23 +288,26 @@
 
 ;; -- GET Feed Articles @ /api/articles/feed ----------------------------------
 ;;
+
+(defn reset-filter
+  [db-fx _ [_ params]]
+  (-> db-fx
+      (assoc-in [:db :filter :offset] (:offset params))
+      (assoc-in [:db :filter :tag] nil)        ;; with feed-articles we turn off almost all
+      (assoc-in [:db :filter :author] nil)     ;; filters to make sure everythinig on the
+      (assoc-in [:db :filter :favorites] nil)  ;; client is displayed correctly.
+      (assoc-in [:db :filter :feed] true)))  ;; This is the only one we need
+
 (reg-event-fx                                               ;; usage (dispatch [:get-feed-articles {:limit 10 :offset 0 ...}])
  :get-feed-articles                                        ;; triggered when Your Feed tab is loaded
- (fn [{:keys [db]} [_ params]]                             ;; params = {:offset 0 :limit 10}
-   {:http-xhrio {:method          :get
-                 :uri             (endpoint "articles" "feed") ;; evaluates to "api/articles/feed"
-                 :params          params                 ;; include params in the request
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:get-feed-articles-success] ;; trigger get-articles-success event
-                 :on-failure      [:api-request-error :get-feed-articles]} ;; trigger api-request-error with :get-feed-articles
-    :db         (-> db
-                    (assoc-in [:loading :articles] true)
-                    (assoc-in [:filter :offset] (:offset params))
-                    (assoc-in [:filter :tag] nil)        ;; with feed-articles we turn off almost all
-                    (assoc-in [:filter :author] nil)     ;; filters to make sure everythinig on the
-                    (assoc-in [:filter :favorites] nil)  ;; client is displayed correctly.
-                    (assoc-in [:filter :feed] true))}))  ;; This is the only one we need
+ (comp-dbfx [(start-loading-indicator :articles)           ;; params = {:offset 0 :limit 10}
+             reset-filter
+             (http-xhrio {:method          :get
+                          :uri             ["articles" "feed"] ;; evaluates to "api/articles/feed"
+                          :params          (fn [_ _ [_ params]]
+                                             params)                 ;; include params in the request
+                          :on-success      [:get-feed-articles-success] ;; trigger get-articles-success event
+                          :on-failure      [:api-request-error :get-feed-articles]})])) ;; trigger api-request-error with :get-feed-articles
 
 (reg-event-db
  :get-feed-articles-success
@@ -258,13 +321,11 @@
 ;;
 (reg-event-fx                                               ;; usage (dispatch [:get-tags])
  :get-tags                                                 ;; triggered when the home page is loaded
- (fn [{:keys [db]} _]                                      ;; second parameter is not important, therefore _
-   {:db         (assoc-in db [:loading :tags] true)
-    :http-xhrio {:method          :get
-                 :uri             (endpoint "tags")      ;; evaluates to "api/tags"
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:get-tags-success]    ;; trigger get-tags-success event
-                 :on-failure      [:api-request-error :get-tags]}})) ;; trigger api-request-error with :get-tags
+ (comp-dbfx [(start-loading-indicator :tags) ;; second parameter is not important, therefore _
+             (http-xhrio {:method          :get
+                          :uri             ["tags"]      ;; evaluates to "api/tags"
+                          :on-success      [:get-tags-success]    ;; trigger get-tags-success event
+                          :on-failure      [:api-request-error :get-tags]})])) ;; trigger api-request-error with :get-tags
 
 (reg-event-db
  :get-tags-success
@@ -277,14 +338,12 @@
 ;;
 (reg-event-fx                                               ;; usage (dispatch [:get-article-comments {:slug "article-slug"}])
  :get-article-comments                                     ;; triggered when the article page is loaded
- (fn [{:keys [db]} [_ params]]                             ;; params = {:slug "article-slug"}
-   {:db         (assoc-in db [:loading :comments] true)
-    :http-xhrio {:method          :get
-                 :uri             (endpoint "articles" (:slug params) "comments") ;; evaluates to "api/articles/:slug/comments"
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:get-article-comments-success] ;; trigger get-article-comments-success
-                 :on-failure      [:api-request-error :get-article-comments]}})) ;; trigger api-request-error with :get-article-comments
+ (comp-dbfx [(start-loading-indicator :comments) ;; params = {:slug "article-slug"}
+             (http-xhrio {:method          :get
+                          :uri             (fn [_ _ [_ params]]
+                                             ["articles" (:slug params) "comments"]) ;; evaluates to "api/articles/:slug/comments"
+                          :on-success      [:get-article-comments-success] ;; trigger get-article-comments-success
+                          :on-failure      [:api-request-error :get-article-comments]})])) ;; trigger api-request-error with :get-article-comments
 
 (reg-event-db
  :get-article-comments-success
@@ -297,16 +356,14 @@
 ;;
 (reg-event-fx                                               ;; usage (dispatch [:post-comment comment])
  :post-comment                                             ;; triggered when a user submits a comment
- (fn [{:keys [db]} [_ body]]                               ;; body = {:body "body" }
-   {:db         (assoc-in db [:loading :comments] true)
-    :http-xhrio {:method          :post
-                 :uri             (endpoint "articles" (:active-article db) "comments") ;; evaluates to "api/articles/:slug/comments"
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :params          {:comment body}
-                 :format          (json-request-format)  ;; make sure we are doing request format wiht json
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:post-comment-success] ;; trigger get-articles-success
-                 :on-failure      [:api-request-error :comments]}})) ;; trigger api-request-error with :comments
+ (comp-dbfx [(start-loading-indicator :comments) ;; body = {:body "body" }
+             (http-xhrio {:method          :post
+                          :uri-parts       (fn [{:keys [db]} _ _]
+                                             ["articles" (:active-article db) "comments"]) ;; evaluates to "api/articles/:slug/comments"
+                          :params          (fn [_ _ [_ body]]
+                                             {:comment body})
+                          :on-success      [:post-comment-success] ;; trigger get-articles-success
+                          :on-failure      [:api-request-error :comments]})])) ;; trigger api-request-error with :comments
 
 (reg-event-fx
  :post-comment-success
@@ -319,19 +376,19 @@
 
 ;; -- DELETE Comments @ /api/articles/:slug/comments/:comment-id ----------------------
 ;;
+(defn set-active-comment
+  [db-fx _ [_ comment-id]] ;; comment-id = 1234
+  (assoc-in db-fx [:db :active-comment] comment-id))
+
 (reg-event-fx                                               ;; usage (dispatch [:delete-comment comment-id])
  :delete-comment                                           ;; triggered when a user deletes an article
- (fn [{:keys [db]} [_ comment-id]]                         ;; comment-id = 1234
-   {:db         (-> db
-                  (assoc-in [:loading :comments] true)
-                  (assoc :active-comment comment-id))
-    :http-xhrio {:method          :delete
-                 :uri             (endpoint "articles" (:active-article db) "comments" comment-id) ;; evaluates to "api/articles/:slug/comments/:comment-id"
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :format          (json-request-format)  ;; make sure we are doing request format wiht json
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:delete-comment-success] ;; trigger delete-comment-success
-                 :on-failure      [:api-request-error :delete-comment]}})) ;; trigger api-request-error with :delete-comment
+ (comp-dbfx [(start-loading-indicator :comments)
+             set-active-comment
+             (http-xhrio {:method          :delete
+                          :uri-parts       (fn [{:keys [db]} _ [_ comment-id]]
+                                             ["articles" (:active-article db) "comments" comment-id]) ;; evaluates to "api/articles/:slug/comments/:comment-id"
+                          :on-success      [:delete-comment-success] ;; trigger delete-comment-success
+                          :on-failure      [:api-request-error :delete-comment]})])) ;; trigger api-request-error with :delete-comment
 
 (reg-event-db
  :delete-comment-success
@@ -345,14 +402,12 @@
 ;;
 (reg-event-fx                                               ;; usage (dispatch [:get-user-profile {:profile "profile"}])
  :get-user-profile                                         ;; triggered when the profile page is loaded
- (fn [{:keys [db]} [_ params]]                             ;; params = {:profile "profile"}
-   {:db         (assoc-in db [:loading :profile] true)
-    :http-xhrio {:method          :get
-                 :uri             (endpoint "profiles" (:profile params)) ;; evaluates to "api/profiles/:profile"
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:get-user-profile-success] ;; trigger get-user-profile-success
-                 :on-failure      [:api-request-error :get-user-profile]}})) ;; trigger api-request-error with :get-user-profile
+ (comp-dbfx [(start-loading-indicator :profile) ;; params = {:profile "profile"}
+             (http-xhrio {:method          :get
+                          :uri             (fn [_ _ [_ params]]
+                                             ["profiles" (:profile params)]) ;; evaluates to "api/profiles/:profile"
+                          :on-success      [:get-user-profile-success] ;; trigger get-user-profile-success
+                          :on-failure      [:api-request-error :get-user-profile]})])) ;; trigger api-request-error with :get-user-profile
 
 (reg-event-db
  :get-user-profile-success
@@ -365,15 +420,13 @@
 ;;
 (reg-event-fx                                               ;; usage (dispatch [:login user])
  :login                                                    ;; triggered when a users submits login form
- (fn [{:keys [db]} [_ credentials]]                        ;; credentials = {:email ... :password ...}
-   {:db         (assoc-in db [:loading :login] true)
-    :http-xhrio {:method          :post
-                 :uri             (endpoint "users" "login") ;; evaluates to "api/users/login"
-                 :params          {:user credentials}    ;; {:user {:email ... :password ...}}
-                 :format          (json-request-format)  ;; make sure it's json
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:login-success]       ;; trigger login-success
-                 :on-failure      [:api-request-error :login]}})) ;; trigger api-request-error with :login
+ (comp-dbfx [(start-loading-indicator :login) ;; credentials = {:email ... :password ...}
+             (http-xhrio {:method          :post
+                          :uri             ["users" "login"] ;; evaluates to "api/users/login"
+                          :params          (fn [_ _ [_ credentials]]
+                                             {:user credentials})    ;; {:user {:email ... :password ...}}
+                          :on-success      [:login-success]       ;; trigger login-success
+                          :on-failure      [:api-request-error :login]})])) ;; trigger api-request-error with :login
 
 (reg-event-fx
  :login-success
@@ -398,15 +451,13 @@
 ;;
 (reg-event-fx                                               ;; usage (dispatch [:register-user registration])
  :register-user                                            ;; triggered when a users submits registration form
- (fn [{:keys [db]} [_ registration]]                       ;; registration = {:username ... :email ... :password ...}
-   {:db         (assoc-in db [:loading :register-user] true)
-    :http-xhrio {:method          :post
-                 :uri             (endpoint "users")     ;; evaluates to "api/users"
-                 :params          {:user registration}   ;; {:user {:username ... :email ... :password ...}}
-                 :format          (json-request-format)  ;; make sure it's json
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:register-user-success] ;; trigger login-success
-                 :on-failure      [:api-request-error :register-user]}})) ;; trigger api-request-error with :login-success
+ (comp-dbfx [(start-loading-indicator :register-user) ;; registration = {:username ... :email ... :password ...}
+             (http-xhrio {:method          :post
+                          :uri             (endpoint "users")     ;; evaluates to "api/users"
+                          :params          (fn [_ _ [_ registration]]
+                                             {:user registration})   ;; {:user {:username ... :email ... :password ...}}
+                          :on-success      [:register-user-success] ;; trigger login-success
+                          :on-failure      [:api-request-error :register-user]})])) ;; trigger api-request-error with :login-success
 
 (reg-event-fx
  :register-user-success
@@ -429,17 +480,14 @@
 ;; -- PUT Update User @ /api/user ---------------------------------------------
 ;;
 (reg-event-fx                                               ;; usage (dispatch [:update-user user])
- :update-user                                              ;; triggered when a users updates settgins
- (fn [{:keys [db]} [_ user]]                               ;; user = {:img ... :username ... :bio ... :email ... :password ...}
-   {:db         (assoc-in db [:loading :update-user] true)
-    :http-xhrio {:method          :put
-                 :uri             (endpoint "user")      ;; evaluates to "api/user"
-                 :params          {:user user}           ;; {:user {:img ... :username ... :bio ... :email ... :password ...}}
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :format          (json-request-format)  ;; make sure our request is json
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:update-user-success] ;; trigger update-user-success
-                 :on-failure      [:api-request-error :update-user]}})) ;; trigger api-request-error with :update-user
+ :update-user                                              ;; triggered when a users updates settings
+ (comp-dbfx [(start-loading-indicator :update-user) ;; user = {:img ... :username ... :bio ... :email ... :password ...}
+             (http-xhrio {:method          :put
+                          :uri             ["user"]      ;; evaluates to "api/user"
+                          :params          (fn [_ _ [_ user]]
+                                             {:user user})           ;; {:user {:img ... :username ... :bio ... :email ... :password ...}}
+                          :on-success      [:update-user-success] ;; trigger update-user-success
+                          :on-failure      [:api-request-error :update-user]})])) ;; trigger api-request-error with :update-user
 
 (reg-event-fx
  :update-user-success
@@ -462,15 +510,13 @@
 ;;
 (reg-event-fx                                               ;; usage (dispatch [:toggle-follow-user username])
  :toggle-follow-user                                       ;; triggered when user clicks follow/unfollow button on profile page
- (fn [{:keys [db]} [_ username]]                           ;; username = :username
-   {:db         (assoc-in db [:loading :toggle-follow-user] true)
-    :http-xhrio {:method          (if (get-in db [:profile :following]) :delete :post) ;; check if we follow if yes DELETE, no POST
-                 :uri             (endpoint "profiles" username "follow") ;; evaluates to "api/profiles/:username/follow"
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :format          (json-request-format)  ;; make sure it's json
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:toggle-follow-user-success] ;; trigger toggle-follow-user-success
-                 :on-failure      [:api-request-error :login]}})) ;; trigger api-request-error with :update-user-success
+ (comp-dbfx [(start-loading-indicator :toggle-follow-user) ;; username = :username
+             (http-xhrio {:method          (fn [{:keys [db]} _ _]
+                                             (if (get-in db [:profile :following]) :delete :post)) ;; check if we follow if yes DELETE, no POST
+                          :uri             (fn [_ _ [_ username]]
+                                             ["profiles" username "follow"]) ;; evaluates to "api/profiles/:username/follow"
+                          :on-success      [:toggle-follow-user-success] ;; trigger toggle-follow-user-success
+                          :on-failure      [:api-request-error :login]})])) ;; trigger api-request-error with :update-user-success
 
 (reg-event-db                                               ;; usage: (dispatch [:toggle-follow-user-success])
  :toggle-follow-user-success
@@ -483,15 +529,13 @@
 ;;
 (reg-event-fx                                               ;; usage (dispatch [:toggle-favorite-article slug])
  :toggle-favorite-article                                  ;; triggered when user clicks favorite/unfavorite button on profile page
- (fn [{:keys [db]} [_ slug]]                               ;; slug = :slug
-   {:db         (assoc-in db [:loading :toggle-favorite-article] true)
-    :http-xhrio {:method          (if (get-in db [:articles slug :favorited]) :delete :post) ;; check if article is already favorite: yes DELETE, no POST
-                 :uri             (endpoint "articles" slug "favorite") ;; evaluates to "api/articles/:slug/favorite"
-                 :headers         (auth-header db)       ;; get and pass user token obtained during login
-                 :format          (json-request-format)  ;; make sure it's json
-                 :response-format (json-response-format {:keywords? true}) ;; json response and all keys to keywords
-                 :on-success      [:toggle-favorite-article-success] ;; trigger toggle-favorite-article-success
-                 :on-failure      [:api-request-error :login]}})) ;; trigger api-request-error with :toggle-favorite-article
+ (comp-dbfx [(start-loading-indicator :toggle-favorite-article) ;; slug = :slug
+             (http-xhrio {:method          (fn [{:keys [db]} _ [_ slug]]
+                                             (if (get-in db [:articles slug :favorited]) :delete :post)) ;; check if article is already favorite: yes DELETE, no POST
+                          :uri             (fn [_ _ [_ slug]]
+                                             ["articles" slug "favorite"]) ;; evaluates to "api/articles/:slug/favorite"
+                          :on-success      [:toggle-favorite-article-success] ;; trigger toggle-favorite-article-success
+                          :on-failure      [:api-request-error :login]})])) ;; trigger api-request-error with :toggle-favorite-article
 
 (reg-event-db                                               ;; usage: (dispatch [:toggle-favorite-article-success])
  :toggle-favorite-article-success
